@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -60,10 +60,12 @@ impl AliyunDrive {
         let mut headers = HeaderMap::new();
         headers.insert("Origin", HeaderValue::from_static(ORIGIN));
         headers.insert("Referer", HeaderValue::from_static(REFERER));
-        headers.insert(
-            "x-canary",
-            HeaderValue::from_static("client=web,app=adrive,version=v3.0.0"),
-        );
+        if config.refresh_token_url.starts_with("websv") {
+            headers.insert(
+                "x-canary",
+                HeaderValue::from_static("client=web,app=adrive,version=v3.0.0"),
+            );
+        }
         let client = reqwest::Client::builder()
             .user_agent(UA)
             .default_headers(headers)
@@ -83,11 +85,8 @@ impl AliyunDrive {
 
         let (tx, rx) = oneshot::channel();
         // schedule update token task
-        let client = drive.clone();
         let refresh_token_from_file = if let Some(dir) = drive.config.workdir.as_ref() {
-            tokio::fs::read_to_string(dir.join("refresh_token"))
-                .await
-                .ok()
+            read_refresh_token(dir).await.ok()
         } else {
             None
         };
@@ -95,6 +94,7 @@ impl AliyunDrive {
             bail!("No refresh token provided! \n📝 Please specify refresh token from `--refresh-token` CLI option.");
         }
 
+        let client = drive.clone();
         tokio::spawn(async move {
             let mut delay_seconds = 7000;
             match client
@@ -141,25 +141,36 @@ impl AliyunDrive {
     }
 
     async fn do_refresh_token(&self, refresh_token: &str) -> Result<RefreshTokenResponse> {
+        let (refresh_token, is_mobile) = parse_refresh_token(refresh_token)?;
         let mut data = HashMap::new();
-        data.insert("refresh_token", refresh_token);
+        data.insert("refresh_token", refresh_token.as_str());
         data.insert("grant_type", "refresh_token");
         if let Some(app_id) = self.config.app_id.as_ref() {
             data.insert("app_id", app_id);
         }
+        let refresh_token_url = if self.config.app_id.is_none() {
+            get_refresh_token_url(is_mobile)
+        } else {
+            &self.config.refresh_token_url
+        };
         let res = self
             .client
-            .post(&self.config.refresh_token_url)
+            .post(refresh_token_url)
             .json(&data)
             .send()
             .await?;
         match res.error_for_status_ref() {
             Ok(_) => {
-                let res = res.json::<RefreshTokenResponse>().await?;
+                let mut res = res.json::<RefreshTokenResponse>().await?;
                 info!(
                     refresh_token = %res.refresh_token,
                     nick_name = %res.nick_name,
                     "refresh token succeed"
+                );
+                res.refresh_token = format!(
+                    "{}:{}",
+                    if is_mobile { "mobile" } else { "web" },
+                    res.refresh_token
                 );
                 Ok(res)
             }
@@ -675,5 +686,25 @@ impl DavDirEntry for AliyunFile {
 
     fn metadata(&self) -> FsFuture<Box<dyn DavMetaData>> {
         async move { Ok(Box::new(self.clone()) as Box<dyn DavMetaData>) }.boxed()
+    }
+}
+
+pub async fn read_refresh_token(workdir: &Path) -> Result<String> {
+    Ok(tokio::fs::read_to_string(workdir.join("refresh_token")).await?)
+}
+
+pub fn parse_refresh_token(content: &str) -> Result<(String, bool)> {
+    let (client, token) = content
+        .trim()
+        .split_once(':')
+        .unwrap_or_else(|| ("web", content.trim()));
+    Ok((token.to_string(), client == "mobile"))
+}
+
+pub fn get_refresh_token_url(is_mobile: bool) -> &'static str {
+    if is_mobile {
+        "https://auth.aliyundrive.com/v2/account/token"
+    } else {
+        "https://websv.aliyundrive.com/token/refresh"
     }
 }
