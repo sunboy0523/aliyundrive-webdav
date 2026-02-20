@@ -1,4 +1,5 @@
 use std::env;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use anyhow::bail;
@@ -220,7 +221,7 @@ async fn main() -> anyhow::Result<()> {
     };
     let refresh_token = if opt.refresh_token.is_none()
         && refresh_token_from_file.is_none()
-        && atty::is(atty::Stream::Stdout)
+        && std::io::stdout().is_terminal()
     {
         login(drive_config.clone(), 30).await?
     } else {
@@ -308,9 +309,17 @@ async fn login(drive_config: DriveConfig, timeout: u64) -> anyhow::Result<String
     let sid = scanner.scan().await?.sid;
     // 需要生成二维码的内容
     let qrcode_content = format!("https://www.aliyundrive.com/o/oauth/authorize?sid={sid}");
-    // 打印二维码
-    qr2term::print_qr(&qrcode_content)?;
-    info!("Please scan the qrcode to login in {} seconds", timeout);
+    #[cfg(feature = "qrcode-display")]
+    {
+        qr2term::print_qr(&qrcode_content)?;
+        info!("Please scan the qrcode to login in {} seconds", timeout);
+    }
+    #[cfg(not(feature = "qrcode-display"))]
+    {
+        info!("Please visit this URL to login:");
+        info!("{}", qrcode_content);
+        info!("You have {} seconds to complete the login", timeout);
+    }
     let loop_count = timeout / SLEEP;
     for _i in 0..loop_count {
         tokio::time::sleep(tokio::time::Duration::from_secs(SLEEP)).await;
